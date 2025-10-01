@@ -1,0 +1,60 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // אם את על Neon/Postgres
+  url      = env("DATABASE_URL")
+}
+
+model Request {
+  id             String   @id @default(cuid())
+  title          String
+  category       String
+  subcategory    String   @default("") // ברירת מחדל כדי למנוע null
+  budgetMin      Int?
+  budgetMax      Int?
+  region         String
+  contactWindow  String // "immediate" | "today" | "this_week" (נשמר כטקסט)
+  requesterName  String
+  requesterEmail String
+  requesterPhone String? // אופציונלי כדי למנוע שגיאות התאמה
+  status         String   @default("open")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // קשר לוגי למיילים (צד בעלים נמצא ב-EmailLog)
+  emails EmailLog[]
+}
+
+model Provider {
+  id         String  @id @default(cuid())
+  orgName    String
+  email      String
+  // נשמרים כטקסט מופרד בתווים | ; ,  (פשוטים ויציבים בכל DB)
+  categories String // למשל: "service|real_estate"
+  tags       String // למשל: "חשמל|דחוף"
+  regions    String // למשל: "מרכז|שפלה"
+  minBudget  Int?
+  maxBudget  Int?
+  active     Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model EmailLog {
+  id        String   @id @default(cuid())
+  to        String
+  subject   String
+  status    String // 'sent' | 'failed'
+  error     String? // טקסט השגיאה אם היתה
+  createdAt DateTime @default(now())
+
+  requestId String?
+  request   Request? @relation(fields: [requestId], references: [id])
+
+  @@index([requestId])
+}

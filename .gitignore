@@ -1,0 +1,26 @@
+﻿# dependencies
+node_modules/
+pnpm-lock.yaml
+yarn.lock
+
+# Next.js build output
+.next/
+out/
+.vercel/
+!.vercel/project.json
+
+# env files (secrets)
+.env
+.env*.local
+
+# Prisma local DBs (שמור רק אם באמת קיימים מקומית)
+prisma/*.db
+prisma/*.sqlite
+
+# logs & misc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+.DS_Store
+coverage/
