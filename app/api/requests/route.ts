@@ -1,141 +1,95 @@
 // app/api/requests/route.ts
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
 import { sendEmail } from '@/lib/mailer';
-// שים לב לשם היצוא מהקובץ שלך: אם אצלך הפונקציה נקראת providerMatches – שנה כאן בהתאם
-import { matchProviders } from '@/lib/match';
 
-export const runtime = 'nodejs';
-
-// ---------- Helpers ----------
-function numOrNull(v: unknown): number | null {
-  if (v === '' || v === null || v === undefined) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-async function readBody(req: Request) {
-  const ctype = req.headers.get('content-type') || '';
-  if (ctype.includes('application/x-www-form-urlencoded')) {
-    const text = await req.text();
-    const params = new URLSearchParams(text);
-    return Object.fromEntries(params.entries());
-  }
-  if (ctype.includes('multipart/form-data')) {
-    const form = await req.formData();
-    const entries: Record<string, any> = {};
-    for (const [k, v] of form.entries()) entries[k] = typeof v === 'string' ? v : v.name;
-    return entries;
-  }
-  if (ctype.includes('application/json')) {
-    try {
-      return await req.json();
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-export async function OPTIONS() {
-  return NextResponse.json({}, { status: 200 });
-}
+type Provider = { email: string };
+type Incoming = {
+  title: string;
+  category?: string;
+  subcategory?: string;
+  region?: string;
+  budgetMin?: number | null;
+  budgetMax?: number | null;
+  requesterName?: string;
+  requesterEmail?: string;
+  requesterPhone?: string;
+  providers?: Provider[];
+};
 
 export async function POST(req: Request) {
-  const raw = await readBody(req);
-  if (!raw || typeof raw !== 'object') {
-    return NextResponse.json({ ok: false, error: 'no-body' }, { status: 400 });
-  }
+  try {
+    const body = (await req.json()) as Incoming;
 
-  const live = String((raw as any).live ?? '1') === '1';
-
-  const title = String((raw as any).title ?? '').trim();
-  const category = String((raw as any).category ?? '').trim() as
-    | 'service'
-    | 'real_estate'
-    | 'second_hand';
-  const subcategory = String((raw as any).subcategory ?? '').trim();
-  const budgetMin = numOrNull((raw as any).budgetMin);
-  const budgetMax = numOrNull((raw as any).budgetMax);
-  const region = String((raw as any).region ?? '').trim();
-  const contactWindow = (String((raw as any).contactWindow ?? 'today').trim() ||
-    'today') as 'immediate' | 'today' | 'this_week';
-  const requesterName = String((raw as any).requesterName ?? '').trim();
-  const requesterEmail = String((raw as any).requesterEmail ?? '').trim();
-  const requesterPhone = String((raw as any).requesterPhone ?? '').trim();
-
-  const missing: string[] = [];
-  if (!title || title.length < 2) missing.push('title');
-  if (!category) missing.push('category');
-  if (!region) missing.push('region');
-  if (!requesterName) missing.push('requesterName');
-  if (!/^\S+@\S+\.\S+$/.test(requesterEmail)) missing.push('requesterEmail');
-  if (missing.length) {
-    return NextResponse.json({ ok: false, error: 'invalid', fields: missing }, { status: 400 });
-  }
-
-  // התאמות ספקים
-  const providers = await prisma.provider.findMany({ where: { active: true } });
-  const shortlist = matchProviders(
-    { category, subcategory, region, budgetMax: budgetMax ?? undefined, title },
-    providers
-  ).slice(0, 20);
-
-  let created: { id: string } | null = null;
-
-  if (live) {
-    // יצירת בקשה ב־DB
-    const base = {
+    const {
       title,
       category,
       subcategory,
+      region,
       budgetMin,
       budgetMax,
-      region,
-      contactWindow,
       requesterName,
       requesterEmail,
-      requesterPhone: requesterPhone || null,
-      status: 'dispatched' as const,
-    };
+      requesterPhone,
+      providers = [],
+    } = body;
 
-    try {
-      created = await prisma.request.create({ data: base });
-    } catch {
-      // אם requesterPhone לא nullable בסכמה
-      const { requesterPhone: _drop, ...rest } = base as any;
-      created = await prisma.request.create({ data: rest });
+    // בונים רשימת נמענים ייחודיים
+    const uniqueTargets = Array.from(
+      new Set(
+        (providers ?? [])
+          .map((p) => (p?.email ?? '').trim())
+          .filter((e) => e.length > 0)
+      )
+    );
+
+    if (!uniqueTargets.length) {
+      return NextResponse.json(
+        { ok: false, error: 'No recipients' },
+        { status: 400 }
+      );
     }
 
-    // שליחת מיילים (חתימה חדשה: sendEmail({ to, subject, body }))
-    const uniqueTargets = Array.from(new Set(shortlist.map((p) => p.email)));
+    // פונקציית אסקייפ ל-HTML
+    const escapeHtml = (s: string) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-    await Promise.allSettled(
-      uniqueTargets.map((email) => {
+    // שולחים לכולם במקביל — בלי 'body' (לא קיים בטיפוס)
+    const results = await Promise.allSettled(
+      uniqueTargets.map(async (email) => {
         const lines = [
-          `קטגוריה: ${category}${subcategory ? `/${subcategory}` : ''}`,
-          `אזור: ${region}`,
-          budgetMax ? `תקציב מקסימלי: ${budgetMax} ₪` : '',
+          `קטגוריה: ${category ?? ''}${subcategory ? ` / ${subcategory}` : ''}`,
+          `אזור: ${region ?? ''}`,
+          budgetMin != null ? `תקציב מינ׳: ₪${budgetMin}` : '',
+          budgetMax != null ? `תקציב מקס׳: ₪${budgetMax}` : '',
           '',
-          'פרטי יוצר:',
-          requesterName,
-          requesterEmail,
-          requesterPhone || '',
+          'פרטי יוזר:',
+          requesterName ?? '',
+          requesterEmail ?? '',
+          requesterPhone ?? '',
         ].filter(Boolean);
+
+        const text = lines.join('\n');
+        const html = lines.map((l) => escapeHtml(l)).join('<br/>');
 
         return sendEmail({
           to: email,
           subject: `NeedMe: בקשה חדשה – ${title}`,
-          body: lines.join('\n'),
+          text,
+          html,
+          // replyTo: 'noreply@mg.needmepro.com', // רק אם תרצה
         });
       })
     );
-  }
 
-  return NextResponse.json({
-    ok: true,
-    live,
-    requestId: created?.id ?? null,
-    matchedProviders: shortlist.length,
-  });
+    const sent = results.filter(
+      (r) => r.status === 'fulfilled' && r.value.ok
+    ).length;
+
+    return NextResponse.json({ ok: true, sent, total: uniqueTargets.length });
+  } catch (e: any) {
+    return NextResponse.json(
+      { ok: false, error: e?.message ?? String(e) },
+      { status: 500 }
+    );
+  }
 }

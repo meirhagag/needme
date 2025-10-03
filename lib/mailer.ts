@@ -1,52 +1,49 @@
 // lib/mailer.ts
 import { Resend } from 'resend';
 
+// משתמשים ב־ENV
 const resend = new Resend(process.env.RESEND_API_KEY ?? '');
+
+// שולח ברירת מחדל (אותו דומיין שאימתנו ב-Resend)
 const FROM = (process.env.MAIL_FROM ?? '').trim();
 
+// הטיפוס היחיד שמשמש אותנו בקוד
 export type SendMailArgs = {
   to: string | string[];
   subject: string;
-  text?: string;
-  html?: string;
-  replyTo?: string | string[];
+  text?: string;         // טקסט פשוט
+  html?: string;         // HTML (אופציונלי)
+  replyTo?: string | string[]; // אם צריך
 };
 
+// פונקציית שליחה יחידה לכל המערכת
 export async function sendEmail({ to, subject, text, html, replyTo }: SendMailArgs) {
-  if (!FROM) {
-    throw new Error('MAIL_FROM is missing');
-  }
-
-  // מרכיב payload רק עם השדות שקיימים, כדי לא לשלוח undefined
-  const payload: Record<string, unknown> = {
-    from: FROM,
-    to,
-    subject,
-  };
-  if (typeof text === 'string') payload.text = text;
-  if (typeof html === 'string') payload.html = html;
-  if (replyTo) payload.replyTo = replyTo; // camelCase – כך ה-SDK מצפה
+  if (!FROM) throw new Error('MAIL_FROM is missing');
 
   try {
-    // cast ל-any פותר את באג/קשיחות הטיפוסים של ה-SDK ומפסיק ריצודים ב-VSCode
-    const res = await resend.emails.send(payload as any);
+    // שים לב: ל־SDK יש גם API של React-Email, לכן אנחנו עושים cast ל-any
+    // כדי לא להכריח שדה react
+    const { data, error } = await resend.emails.send({
+      from: FROM,
+      to,
+      subject,
+      text,
+      html,
+      replyTo,
+    } as any);
 
-    // תמיכה גם בצורה { data, error } וגם בצורה שטוחה יותר אם תגיע
+    // התאמה לשינויים אפשריים במבנה התשובה בין גרסאות
     const id =
-      (res as any)?.data?.id ??
-      (res as any)?.id ??
-      null;
-
-    const error =
-      (res as any)?.error ??
-      (res as any)?.data?.error ??
+      (data as any)?.id ??
+      (data as any)?.data?.id ??
       null;
 
     if (error) {
-      return { ok: false, id, error: String(error?.message ?? error) };
+      return { ok: false, id, error: String((error as any)?.message ?? error) };
     }
-    return { ok: !!id, id, error: null };
+
+    return { ok: true, id, error: null };
   } catch (e: any) {
-    return { ok: false, id: null, error: String(e?.message ?? e) };
+    return { ok: false, id: null, error: e?.message ?? String(e) };
   }
 }
