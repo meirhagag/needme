@@ -1,57 +1,82 @@
 // app/api/requests/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-import { sendEmail } from '@/lib/mailer';
+import { NextResponse } from 'next/server';
+import sendEmail from '@/lib/mailer';
 
-function bad(status: number, error: string, extra: any = {}) {
-  console.error('[requests] ->', status, error, extra);
-  return NextResponse.json({ ok: false, error, ...extra }, { status });
-}
-
-export async function POST(req: NextRequest) {
+// פרסר גנרי: JSON / x-www-form-urlencoded / multipart/form-data
+async function readRequestData(req: Request): Promise<Record<string, any>> {
   const ct = req.headers.get('content-type') || '';
-  let body: any = {};
 
-  // 1) Parse body safely לפי סוג התוכן
   try {
     if (ct.includes('application/json')) {
-      body = await req.json();
-    } else if (ct.includes('application/x-www-form-urlencoded')) {
-      const form = await req.formData();
-      body = Object.fromEntries(form.entries());
-    } else if (ct.includes('text/plain')) {
-      const txt = await req.text();
-      try { body = JSON.parse(txt); } catch { body = { text: txt }; }
-    } else {
-      return bad(415, 'Unsupported Content-Type', { contentType: ct });
+      return await req.json();
     }
-  } catch (e: any) {
-    return bad(400, 'Invalid body', { parseError: String(e?.message ?? e) });
+    if (ct.includes('application/x-www-form-urlencoded')) {
+      const text = await req.text();
+      return Object.fromEntries(new URLSearchParams(text));
+    }
+    if (ct.includes('multipart/form-data')) {
+      const fd = await req.formData();
+      return Object.fromEntries(fd.entries());
+    }
+  } catch {
+    // נמשיך לפולבק
   }
 
-  // 2) נרמול שדות שמגיעים ממקורות שונים
-  const to = String(body.email ?? body.to ?? '').trim();
-  const title = String(body.title ?? body.subject ?? 'בקשה חדשה');
-  const lines =
-    Array.isArray(body.lines)
-      ? body.lines.map(String)
-      : String(body.body ?? body.text ?? '')
-          .split('\n')
-          .map((s) => s.trim())
-          .filter(Boolean);
+  // פולבאק אחרון
+  try { return await req.json(); } catch {}
+  try {
+    const text = await req.text();
+    if (text) return Object.fromEntries(new URLSearchParams(text));
+  } catch {}
 
-  if (!to) return bad(400, 'Missing "email"/"to"');
-  if (!lines.length) lines.push(''); // לא חובה טקסט
+  return {};
+}
 
-  // 3) שליחה דרך המיילר
-  const { ok, id, error } = await sendEmail({
-    to,
-    subject: `NeedMe: ${title}`,
-    text: lines.join('\n'),
-    html: undefined,            // אם תרצה HTML — אפשר לבנות בהמשך
-    replyTo: body.replyTo ?? undefined,
+export async function POST(req: Request) {
+  const data = await readRequestData(req);
+
+  // לוג עזר (יראה בוורסל פונקצ׳ן לוגס)
+  console.log('[requests] incoming', {
+    contentType: req.headers.get('content-type'),
+    dataKeys: Object.keys(data),
   });
 
-  if (!ok) return bad(502, 'resend error', { resendError: error });
+  // איסוף שדות
+  const title = (data.title ?? '').toString().trim();
+  const email =
+    (data.email ?? data.replyTo ?? '').toString().trim(); // המשתמש – replyTo
+  const rawBody = data.body ?? '';
+  const lines =
+    Array.isArray(rawBody) ? rawBody.map(String) : [String(rawBody || '')];
 
-  return NextResponse.json({ ok: true, id }, { status: 200 });
+  if (!email) {
+    return NextResponse.json(
+      { ok: false, error: 'Missing "email" (replyTo)' },
+      { status: 400 }
+    );
+  }
+
+  const subject = title ? `NeedMe: בקשה חדשה - ${title}` : 'NeedMe: בקשה חדשה';
+  const text = lines.filter(Boolean).join('\n') || '(ללא תוכן)';
+
+  // את ה"to" כדאי לקבע בצד השרת (לא לקבל מהלקוח)
+  const TO = process.env.REQUESTS_TO ?? 'inbox@yourdomain.com';
+
+  const { ok, id, error } = await sendEmail({
+    to: TO,
+    subject,
+    text,
+    replyTo: email, // camelCase – חשוב!
+  });
+
+  if (!ok) {
+    return NextResponse.json({ ok, error }, { status: 500 });
+  }
+
+  return NextResponse.json({ ok, id });
+}
+
+// בריאות מהיר ל-GET (אופציונלי)
+export async function GET() {
+  return NextResponse.json({ ok: true });
 }
