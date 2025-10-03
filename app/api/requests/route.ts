@@ -1,74 +1,57 @@
 // app/api/requests/route.ts
-import { NextResponse } from "next/server";
-import { sendEmail } from "@/lib/mailer";
+import { NextRequest, NextResponse } from 'next/server';
+import { sendEmail } from '@/lib/mailer';
 
-type ReqShape = {
-  email?: string;
-  title?: string;
-  lines?: string[] | string;
-};
-
-function toArray(v?: string[] | string): string[] {
-  if (!v) return [];
-  return Array.isArray(v) ? v : [v];
+function bad(status: number, error: string, extra: any = {}) {
+  console.error('[requests] ->', status, error, extra);
+  return NextResponse.json({ ok: false, error, ...extra }, { status });
 }
 
-export async function POST(req: Request) {
-  const ct = req.headers.get("content-type") || "";
-  let data: ReqShape = {};
+export async function POST(req: NextRequest) {
+  const ct = req.headers.get('content-type') || '';
+  let body: any = {};
 
+  // 1) Parse body safely לפי סוג התוכן
   try {
-    if (ct.includes("application/json")) {
-      data = await req.json();
-    } else if (ct.includes("application/x-www-form-urlencoded")) {
-      const text = await req.text();
-      data = Object.fromEntries(new URLSearchParams(text)) as ReqShape;
-      // אם מגיעה מחרוזת שורות, נפרק לפסיקים/שבירות שורה
-      if (typeof data.lines === "string") {
-        data.lines = data.lines.split(/\r?\n|,/).map(s => s.trim()).filter(Boolean);
-      }
-    } else if (ct.includes("multipart/form-data")) {
+    if (ct.includes('application/json')) {
+      body = await req.json();
+    } else if (ct.includes('application/x-www-form-urlencoded')) {
       const form = await req.formData();
-      const obj: Record<string, any> = {};
-      for (const [k, v] of form.entries()) obj[k] = v;
-      if (typeof obj.lines === "string") {
-        obj.lines = obj.lines.split(/\r?\n|,/).map((s: string) => s.trim()).filter(Boolean);
-      }
-      data = obj as ReqShape;
+      body = Object.fromEntries(form.entries());
+    } else if (ct.includes('text/plain')) {
+      const txt = await req.text();
+      try { body = JSON.parse(txt); } catch { body = { text: txt }; }
     } else {
-      return NextResponse.json(
-        { ok: false, error: `Unsupported Content-Type: ${ct}` },
-        { status: 415 }
-      );
+      return bad(415, 'Unsupported Content-Type', { contentType: ct });
     }
-
-    const to = toArray(data.email ?? "");
-    if (to.length === 0) {
-      return NextResponse.json({ ok: false, error: "Missing 'email' (recipient)" }, { status: 400 });
-    }
-
-    const subject = data.title ?? "NeedMe – בקשה חדשה";
-    const lines = toArray(data.lines);
-    const text = lines.length ? lines.join("\n") : undefined;
-    const html = lines.length ? lines.map(l => `<div>${l}</div>`).join("") : undefined;
-
-    const result = await sendEmail({
-      to,
-      subject,
-      text,
-      html,
-      // אפשר לסמן reply-to אם תרצה:
-      // replyTo: "support@needmepro.com",
-    });
-
-    if (!result.ok) {
-      return NextResponse.json({ ok: false, error: result.error, id: result.id }, { status: 502 });
-    }
-    return NextResponse.json({ ok: true, id: result.id });
   } catch (e: any) {
-    return NextResponse.json(
-      { ok: false, error: String(e?.message ?? e) },
-      { status: 500 }
-    );
+    return bad(400, 'Invalid body', { parseError: String(e?.message ?? e) });
   }
+
+  // 2) נרמול שדות שמגיעים ממקורות שונים
+  const to = String(body.email ?? body.to ?? '').trim();
+  const title = String(body.title ?? body.subject ?? 'בקשה חדשה');
+  const lines =
+    Array.isArray(body.lines)
+      ? body.lines.map(String)
+      : String(body.body ?? body.text ?? '')
+          .split('\n')
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+  if (!to) return bad(400, 'Missing "email"/"to"');
+  if (!lines.length) lines.push(''); // לא חובה טקסט
+
+  // 3) שליחה דרך המיילר
+  const { ok, id, error } = await sendEmail({
+    to,
+    subject: `NeedMe: ${title}`,
+    text: lines.join('\n'),
+    html: undefined,            // אם תרצה HTML — אפשר לבנות בהמשך
+    replyTo: body.replyTo ?? undefined,
+  });
+
+  if (!ok) return bad(502, 'resend error', { resendError: error });
+
+  return NextResponse.json({ ok: true, id }, { status: 200 });
 }
