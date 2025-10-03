@@ -1,8 +1,19 @@
 // lib/mailer.ts
 import { Resend } from 'resend';
 
-/** קלט אלגנטי לשליחה */
-export type SendMailArgs = {
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const MAIL_FROM = process.env.MAIL_FROM || 'NeedMe <onboarding@resend.dev>';
+// אם תרצה לכפות שליחה לכתובת אחת בסביבת DEV:
+const DEV_MAIL_REDIRECT = process.env.DEV_MAIL_REDIRECT || '';
+
+if (!RESEND_API_KEY) {
+  // לא מפיל את השרת — רק מזהיר בלוג
+  console.warn('[mailer] Missing RESEND_API_KEY – emails will be no-op.');
+}
+
+const resend = new Resend(RESEND_API_KEY);
+
+type SendEmailObjectArgs = {
   to: string | string[];
   subject: string;
   text?: string;
@@ -10,86 +21,73 @@ export type SendMailArgs = {
   replyTo?: string | string[];
 };
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+type SendEmailResult =
+  | { ok: true; id: string | null }
+  | { ok: false; error: unknown };
 
-/** From ברירת מחדל אם לא הוגדר ב־ENV */
-const FROM =
-  (process.env.MAIL_FROM || '').trim() ||
-  'NeedMe <onboarding@resend.dev>';
-
-/** במצב פיתוח – אפשר לבצע הפניית יעד למייל ייעודי */
-const DEV_REDIRECT = (process.env.DEV_MAIL_REDIRECT || '').trim();
-
-/** עוזר: מסדר את היעד אם יש redirect */
-function normalizeTo(to: string | string[]): string | string[] {
-  if (DEV_REDIRECT) return DEV_REDIRECT;
-  return to;
-}
-
-/** עוזר: משאיר רק שדות שהוגדרו */
-function pick<T extends Record<string, unknown>>(obj: T) {
-  const out: Record<string, unknown> = {};
-  Object.keys(obj).forEach((k) => {
-    const v = (obj as any)[k];
-    if (v !== undefined && v !== null && v !== '') out[k] = v;
-  });
-  return out;
-}
-
-/**
- * שליחת מייל דרך Resend
- * תואם גם לגרסאות v3 וגם v4 (כולל טיפול בבעיית טיפוסים של react ב־v4).
- */
-export async function sendEmail(opts: SendMailArgs) {
-  const { subject, text, html, replyTo } = opts;
-  const to = normalizeTo(opts.to);
-
-  if (!FROM) {
-    return { ok: false, error: 'MAIL_FROM is missing' as const };
-  }
-  if (!process.env.RESEND_API_KEY) {
-    return { ok: false, error: 'RESEND_API_KEY is missing' as const };
-  }
-
-  // payload עם כל השדות החוקיים לפי v3/v4. ב-v4 יש "replyTo" (camelCase)
-  const basePayload = pick({
-    from: FROM,
-    to,
-    subject,
-    text,
-    html,
-    replyTo,
-  });
-
-  // עקיפה בטוחה לטיפוסים של v4 שמכריחים react:
-  // נשלח כ-any. בפועל Resend מקבל את זה מצוין.
-  let res: any;
+// פונקציה תואמת לשתי צורות קריאה:
+// 1) sendEmail(to, subject, body[, replyTo])
+// 2) sendEmail({ to, subject, text?, html?, replyTo? })
+export async function sendEmail(
+  arg1: string | string[] | SendEmailObjectArgs,
+  subject?: string,
+  body?: string,
+  replyTo?: string | string[],
+): Promise<SendEmailResult> {
   try {
-    res = await resend.emails.send(basePayload as any);
-  } catch (e: any) {
-    return { ok: false, error: e?.message ?? String(e) };
+    // בניית options בצורה אחידה
+    let opts: SendEmailObjectArgs;
+    if (typeof arg1 === 'string' || Array.isArray(arg1)) {
+      // חתימה ישנה
+      opts = {
+        to: arg1,
+        subject: subject ?? '',
+        text: body,
+        html: body ? `<pre style="font-family:ui-monospace,monospace;white-space:pre-wrap">${escapeHtml(body)}</pre>` : undefined,
+        replyTo,
+      };
+    } else {
+      // חתימה חדשה עם אובייקט
+      opts = arg1;
+    }
+
+    // ולידציה בסיסית
+    if (!opts.to || !opts.subject) {
+      return { ok: false, error: new Error('Missing "to" or "subject"') };
+    }
+
+    // הפניה בסביבת פיתוח אם הוגדר DEV_MAIL_REDIRECT
+    const toFinal = DEV_MAIL_REDIRECT ? DEV_MAIL_REDIRECT : opts.to;
+
+    // בניית payload עבור Resend
+    const payload = {
+      from: MAIL_FROM,
+      to: toFinal,
+      subject: opts.subject,
+      text: opts.text,
+      html: opts.html,
+      replyTo: opts.replyTo,
+    };
+
+    // ---- הקסם של אפשרות 1: לעקוף טיפוסים בעייתיים באמצעות any ----
+    const resp = await resend.emails.send(payload as any);
+
+    // החזרת תוצאה עקבית
+    const id = (resp as any)?.id ?? null;
+    const error = (resp as any)?.error;
+    if (error) {
+      return { ok: false, error };
+    }
+    return { ok: true, id };
+  } catch (err) {
+    return { ok: false, error: err };
   }
-
-  // התאמה לשני פורמטים אפשריים של תשובה:
-  const id =
-    res?.data?.id ?? // v4
-    res?.id ??       // v3
-    null;
-
-  const errorMsg =
-    res?.error?.message ??
-    res?.message ??
-    null;
-
-  if (errorMsg) {
-    console.error('[mailer] resend error =>', errorMsg, 'res=', res);
-    return { ok: false, error: String(errorMsg) };
-  }
-
-  return { ok: true, id: id ?? undefined };
 }
 
-/** פונקציה עוטפת לשליחה פשוטה: טקסט בלבד */
-export async function sendSimple(to: string | string[], subject: string, body: string) {
-  return sendEmail({ to, subject, text: body });
+// עוזר קטן להגנה ב-HTML מינימלית
+function escapeHtml(s: string) {
+  return s
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
 }
