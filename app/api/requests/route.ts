@@ -1,82 +1,120 @@
 // app/api/requests/route.ts
 import { NextResponse } from 'next/server';
-import sendEmail from '@/lib/mailer';
+import { sendEmail } from '@/lib/mailer';
 
-// פרסר גנרי: JSON / x-www-form-urlencoded / multipart/form-data
-async function readRequestData(req: Request): Promise<Record<string, any>> {
+export const runtime = 'nodejs';           // אין צורך ב-Edge כאן
+export const dynamic = 'force-dynamic';    // כדי שלא יוטמן
+
+function getFirst(body: Record<string, any>, keys: string[]) {
+  for (const k of keys) {
+    const v = body[k];
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+  }
+  return undefined;
+}
+
+async function parseBody(req: Request): Promise<Record<string, any>> {
   const ct = req.headers.get('content-type') || '';
-
   try {
     if (ct.includes('application/json')) {
       return await req.json();
     }
     if (ct.includes('application/x-www-form-urlencoded')) {
       const text = await req.text();
-      return Object.fromEntries(new URLSearchParams(text));
+      const params = new URLSearchParams(text);
+      const obj: Record<string, any> = {};
+      params.forEach((v, k) => (obj[k] = v));
+      return obj;
     }
     if (ct.includes('multipart/form-data')) {
       const fd = await req.formData();
-      return Object.fromEntries(fd.entries());
+      const obj: Record<string, any> = {};
+      for (const [k, v] of fd.entries()) obj[k] = typeof v === 'string' ? v : v.name;
+      return obj;
     }
-  } catch {
-    // נמשיך לפולבק
+  } catch (e) {
+    console.error('[requests] parse error', e);
   }
-
-  // פולבאק אחרון
-  try { return await req.json(); } catch {}
-  try {
-    const text = await req.text();
-    if (text) return Object.fromEntries(new URLSearchParams(text));
-  } catch {}
-
   return {};
 }
 
 export async function POST(req: Request) {
-  const data = await readRequestData(req);
+  const body = await parseBody(req);
 
-  // לוג עזר (יראה בוורסל פונקצ׳ן לוגס)
+  // לוג דיבוג מאופק – תראה ב-Logs ב-Vercel
   console.log('[requests] incoming', {
     contentType: req.headers.get('content-type'),
-    dataKeys: Object.keys(data),
+    dataKeys: Object.keys(body),
   });
 
-  // איסוף שדות
-  const title = (data.title ?? '').toString().trim();
-  const email =
-    (data.email ?? data.replyTo ?? '').toString().trim(); // המשתמש – replyTo
-  const rawBody = data.body ?? '';
-  const lines =
-    Array.isArray(rawBody) ? rawBody.map(String) : [String(rawBody || '')];
+  // מפה שמות "ישנים" ו"חדשים"
+  const title         = getFirst(body, ['title', 'subjectTitle']);
+  const category      = getFirst(body, ['category']);
+  const subcategory   = getFirst(body, ['subcategory']);
+  const budgetMax     = getFirst(body, ['budgetMax', 'budget']);
+  const region        = getFirst(body, ['region']);
+  const contactWindow = getFirst(body, ['contactWindow']);
+  const name          = getFirst(body, ['name', 'requesterName', 'fullName']);
+  const email         = getFirst(body, ['email', 'requesterEmail', 'from']);
+  const phone         = getFirst(body, ['phone', 'requesterPhone', 'tel']);
+  const details       = getFirst(body, ['details', 'body', 'message', 'desc']);
+  const live          = getFirst(body, ['live']);
 
-  if (!email) {
-    return NextResponse.json(
-      { ok: false, error: 'Missing "email" (replyTo)' },
-      { status: 400 }
-    );
+  // אימייל יעד (סביבה)
+  const TO = process.env.REQUESTS_TO?.trim();
+  if (!TO) {
+    console.error('[requests] missing env REQUESTS_TO');
+    return NextResponse.json({ ok: false, error: 'REQUESTS_TO env is missing' }, { status: 500 });
   }
 
-  const subject = title ? `NeedMe: בקשה חדשה - ${title}` : 'NeedMe: בקשה חדשה';
-  const text = lines.filter(Boolean).join('\n') || '(ללא תוכן)';
+  // אם אין אימייל שולח – לא נכשיל, אבל נסמן שאין replyTo
+  if (!email) {
+    console.warn('[requests] missing sender email (email/requesterEmail)');
+  }
 
-  // את ה"to" כדאי לקבע בצד השרת (לא לקבל מהלקוח)
-  const TO = process.env.REQUESTS_TO ?? 'inbox@yourdomain.com';
+  // בנה נושא/גוף
+  const subject =
+    `NeedMe: בקשה חדשה - ${title || category || 'ללא כותרת'}`;
 
-  const { ok, id, error } = await sendEmail({
+  const lines: string[] = [];
+  if (title)         lines.push(`כותרת: ${title}`);
+  if (category)      lines.push(`קטגוריה: ${category}`);
+  if (subcategory)   lines.push(`תת-קטגוריה: ${subcategory}`);
+  if (budgetMax)     lines.push(`תקציב: ${budgetMax}`);
+  if (region)        lines.push(`אזור: ${region}`);
+  if (contactWindow) lines.push(`חלון יצירת קשר: ${contactWindow}`);
+  if (name)          lines.push(`שם: ${name}`);
+  if (email)         lines.push(`אימייל: ${email}`);
+  if (phone)         lines.push(`טלפון: ${phone}`);
+  if (live)          lines.push(`live: ${live}`);
+  if (details) {
+    lines.push('');
+    lines.push('פרטים:');
+    lines.push(details);
+  }
+
+  const text = lines.join('\n');
+  const html =
+    `<div dir="rtl" style="font-family: Arial, sans-serif">
+      ${lines.map(l => {
+        const [label, ...rest] = l.split(':');
+        if (rest.length === 0) return `<p>${l}</p>`;
+        return `<p><strong>${label}:</strong> ${rest.join(':').trim()}</p>`;
+      }).join('')}
+    </div>`;
+
+  const res = await sendEmail({
     to: TO,
     subject,
     text,
-    replyTo: email, // camelCase – חשוב!
+    html,
+    replyTo: email,     // אם אין אימייל זה פשוט undefined וזה בסדר
   });
 
-  if (!ok) {
-    return NextResponse.json({ ok, error }, { status: 500 });
+  if (!res.ok) {
+    console.error('[requests] send failed', res.error);
+    return NextResponse.json({ ok: false, error: res.error }, { status: 500 });
   }
 
-  return NextResponse.json({ ok, id });
-}
-
-// בריאות מהיר ל-GET (אופציונלי)
-export async function GET() {
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, id: res.id }, { status: 200 });
 }
